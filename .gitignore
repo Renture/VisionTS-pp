@@ -230,3 +230,8 @@ app.py
 run_local.sh
 
 user_sessions/
+
+# Course experiment symlinks and outputs
+ckpt/
+dataset/
+save/
