@@ -200,6 +200,8 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
 
     if stage == "step2_quantile":
         # Step 2a: Multi-quantile heads (q5 & q9) + Pinball Loss + CRPS on ETTm1 (all 4) & Weather (96, 192)
+        eff_ft = args.ft_type if args.ft_type != "ln" else "ln_head"
+        eff_ep = args.epochs if args.epochs > 1 else 3
         targets = [("ETTm1", [96, 192, 336, 720]), ("Weather", [96, 192])]
         for q_mode in ("q5", "q9"):
             for ds, horizons in targets:
@@ -207,7 +209,7 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
                     for seed in args.seeds:
                         cfg = dict(base)
                         cfg.update(
-                            tag=f"s2_{q_mode}_{args.align_mode}_{args.ft_type}",
+                            tag=f"s2_{q_mode}_{args.align_mode}_{eff_ft}",
                             dataset=ds,
                             horizon=h,
                             seed=seed,
@@ -218,14 +220,17 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
                             align_mode=args.align_mode,
                             quantile_mode=q_mode,
                             clip_mode=args.clip_mode,
-                            ft_type=args.ft_type if args.ft_type != "ln" else "ln_head",
-                            epochs=args.epochs if args.epochs > 1 else 3,
+                            ft_type=eff_ft,
+                            epochs=eff_ep,
                         )
                         jobs.append(cfg)
         return jobs
 
     if stage == "step2_boundary":
         # Step 2b: Boundary adaptation comparison on ETTm2 (96, 192) and Weather (96, 192)
+        eff_q = args.quantile_mode if args.quantile_mode != "none" else "q5"
+        eff_ft = args.ft_type if args.ft_type != "ln" else "ln_head"
+        eff_ep = args.epochs if args.epochs > 1 else 3
         targets = [("ETTm2", [96, 192]), ("Weather", [96, 192])]
         for clip_mode in ("none", "hard_clip", "filter_train", "soft_clip"):
             for ds, horizons in targets:
@@ -233,7 +238,7 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
                     for seed in args.seeds:
                         cfg = dict(base)
                         cfg.update(
-                            tag=f"s2_bound_{clip_mode}_{args.quantile_mode}",
+                            tag=f"s2_bound_{clip_mode}_{eff_q}",
                             dataset=ds,
                             horizon=h,
                             seed=seed,
@@ -242,22 +247,25 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
                             sim_metric="pearson",
                             color_mode="random_adj",
                             align_mode=args.align_mode,
-                            quantile_mode=args.quantile_mode if args.quantile_mode != "none" else "q5",
+                            quantile_mode=eff_q,
                             clip_mode=clip_mode,
-                            ft_type=args.ft_type if args.ft_type != "ln" else "ln_head",
-                            epochs=args.epochs if args.epochs > 1 else 3,
+                            ft_type=eff_ft,
+                            epochs=eff_ep,
                         )
                         jobs.append(cfg)
         return jobs
 
     if stage == "step2_ft_scope":
         # Step 2c: Fine-tuning parameter scope ablation on ETTm1 (96, 192), 1~3 epochs + early stopping
+        eff_q = args.quantile_mode if args.quantile_mode != "none" else "q5"
+        eff_clip = args.clip_mode if args.clip_mode != "none" else "soft_clip"
+        eff_ep = args.epochs if args.epochs > 1 else 3
         for ft_type in ("ln_head", "ln_head_patch", "ln_head_lora"):
             for h in (96, 192):
                 for seed in args.seeds:
                     cfg = dict(base)
                     cfg.update(
-                        tag=f"s2_ft_{ft_type}_{args.quantile_mode}_{args.clip_mode}",
+                        tag=f"s2_ft_{ft_type}_{eff_q}_{eff_clip}",
                         dataset="ETTm1",
                         horizon=h,
                         seed=seed,
@@ -266,10 +274,10 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
                         sim_metric="pearson",
                         color_mode="random_adj",
                         align_mode=args.align_mode,
-                        quantile_mode=args.quantile_mode if args.quantile_mode != "none" else "q5",
-                        clip_mode=args.clip_mode if args.clip_mode != "none" else "soft_clip",
+                        quantile_mode=eff_q,
+                        clip_mode=eff_clip,
                         ft_type=ft_type,
-                        epochs=args.epochs if args.epochs > 1 else 3,
+                        epochs=eff_ep,
                     )
                     jobs.append(cfg)
         return jobs
