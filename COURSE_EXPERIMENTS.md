@@ -3,9 +3,8 @@
 本仓库基于官方 [HALF111/VisionTSpp](https://github.com/HALF111/VisionTSpp)（保留在 `upstream-base` 标签），新增 `visiontspp_course/` 独立实验套件：
 
 - **零额外依赖**：完全适配容器现有 `visionts` 环境（Python 3.8 + PyTorch 1.7.1 + torchvision 0.8.2 + timm 0.3.2），无需安装 `uni2ts` / PyTorch 2.x。
-- **物理卡隔离**：默认通过 `nvidia-smi` UUID 锁定物理 **GPU 1**，不干扰 2/3 号卡正在运行的 Table 21。
-- **口径一致**：数据集切分与 `StandardScaler`（仅拟合训练集）与原版 VisionTS Table 9 / Table 21 完全一致。
-- **自动续跑与汇总**：每个任务保存 `metrics.json` 与 `trainable_weights.pt`，实时生成 `runs.csv` 和 `summary.csv`（含 MSE、MAE、CRPS、单 epoch 耗时、峰值显存、可训练参数量）。
+- **双卡并行与显存保护**：默认通过 `nvidia-smi` UUID 并行调度到物理 **GPU 2 和 GPU 3**，并将单步图像上限设为 `--max-imgs-per-step 32`（峰值显存约 5~7 GB/卡，可在 24 GB 3090 上与 Table 21 稳定共存）。
+- **统一结果目录**：所有阶段的日志（`logs/*.log`）、权重与单次指标（`runs/`）、总表（`runs.csv`、`summary.csv`）统一保存在 `save/course_exp/` 下。
 
 ## 1. 容器拉取与初始化
 

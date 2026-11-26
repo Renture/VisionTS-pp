@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Staged experiment runner for VisionTS++ course improvements on a dedicated GPU (default: physical GPU 1).
+"""Multi-GPU parallel staged experiment runner for VisionTS++ course improvements.
 
-100% compatible with Python 3.8 + PyTorch 1.7.1 + torchvision 0.8.2 + timm 0.3.2.
-Never touches GPUs 2 & 3 unless explicitly specified via --gpu.
+- Supports parallel execution across multiple physical GPUs (default: --gpus 2 3) via UUID binding.
+- Capped micro-batch image budget (--max-imgs-per-step 32) keeps VRAM safely ~5-7 GB per GPU
+  so it can safely coexist with Table 21 (~7 GB used on 24 GB RTX 3090).
+- Stores all logs, weights, metrics, runs.csv, and summary.csv under ONE unified folder (--save-dir).
+- 100% compatible with Python 3.8 + PyTorch 1.7.1 + torchvision 0.8.2 + timm 0.3.2.
 """
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 import csv
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import random
@@ -16,7 +21,8 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import traceback
+from typing import Any, Dict, List, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +30,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def resolve_gpu_uuid(gpu_index: str) -> str:
-    """Map physical nvidia-smi GPU index to its UUID so CUDA_VISIBLE_DEVICES is unambiguous."""
+def resolve_gpu_uuids(gpu_indices: List[str]) -> Dict[str, str]:
+    """Map physical nvidia-smi GPU indices to their UUIDs."""
+    if len(gpu_indices) == 1 and gpu_indices[0].lower() == "cpu":
+        return {"cpu": "cpu"}
     result = subprocess.run(
         ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
         check=True,
@@ -40,19 +48,12 @@ def resolve_gpu_uuid(gpu_index: str) -> str:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) >= 2:
             available[parts[0]] = parts[1]
-    if gpu_index not in available:
-        raise ValueError(f"Physical GPU {gpu_index!r} not found in nvidia-smi (available: {sorted(available)})")
-    return available[gpu_index]
-
-
-def bind_gpu_early(gpu_arg: str) -> str:
-    """Bind CUDA_VISIBLE_DEVICES before torch is imported."""
-    if gpu_arg.lower() == "cpu":
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        return "cpu"
-    uuid = resolve_gpu_uuid(gpu_arg)
-    os.environ["CUDA_VISIBLE_DEVICES"] = uuid
-    return uuid
+    missing = [g for g in gpu_indices if g not in available]
+    if missing:
+        raise ValueError(
+            f"Physical GPU(s) {missing} not found in nvidia-smi (available: {sorted(available)})"
+        )
+    return {g: available[g] for g in gpu_indices}
 
 
 def adjust_lr_type1(optimizer, epoch: int, base_lr: float):
@@ -63,12 +64,14 @@ def adjust_lr_type1(optimizer, epoch: int, base_lr: float):
 
 
 def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
-    """Expand a named stage into an ordered list of clean, reproducible experiment configs."""
+    """Expand a named stage into an ordered list of reproducible experiment configs."""
     base = dict(
+        stage=stage,
         arch=args.arch,
         lr=args.lr,
         batch_size=args.batch_size,
         micro_batch=args.micro_batch,
+        max_imgs_per_micro_batch=args.max_imgs_per_step,
         patience=args.patience,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -86,7 +89,8 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
                 for seed in args.seeds:
                     cfg = dict(base)
                     cfg.update(
-                        tag=args.tag or f"{args.grouping}_K{args.max_group_size}_{args.color_mode}_{args.align_mode}_{args.quantile_mode}_{args.clip_mode}_{args.ft_type}",
+                        tag=args.tag
+                        or f"{args.grouping}_K{args.max_group_size}_{args.color_mode}_{args.align_mode}_{args.quantile_mode}_{args.clip_mode}_{args.ft_type}",
                         dataset=ds,
                         horizon=h,
                         seed=seed,
@@ -104,7 +108,6 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         return jobs
 
     if stage == "step1_smoke":
-        # Fast ~30s verification covering Step 1 (color + window_corr) & Step 2 (q5 + soft_clip + lora)
         smoke_specs = [
             ("smoke_s1_ettm1", "ETTm1", 96, "window_corr", 7, "pearson", "random_adj", "half", "none", "none", "ln", 1),
             ("smoke_s1_weather", "Weather", 96, "window_corr", 7, "pearson", "random_adj", "align_const", "none", "none", "ln", 1),
@@ -133,11 +136,10 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         return jobs
 
     if stage == "step1_quick":
-        # Step 1 fast acceptance: ETTm1 (96,192,336,720) + Weather (96,192),
-        # MSE loss + LN-only + colorized window_corr (K=7), comparing half (W/2) vs align_const.
+        # Put Weather (larger) first so both GPUs finish closer together
         targets = [
-            ("ETTm1", [96, 192, 336, 720]),
             ("Weather", [96, 192]),
+            ("ETTm1", [96, 192, 336, 720]),
         ]
         for align_mode in ("half", "align_const"):
             for ds, horizons in targets:
@@ -163,7 +165,6 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         return jobs
 
     if stage == "step1_ablation":
-        # Controlled ablations for grouping (all vs sequential vs train_corr vs window_corr) & color (gray vs color)
         variants = [
             ("s1_all_color", "all", 21, "pearson", "random_adj"),
             ("s1_seq_K7_color", "sequential", 7, "pearson", "random_adj"),
@@ -176,7 +177,7 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         for tag, grp, k, sim, col in variants:
             for ds, horizons in targets:
                 if ds == "ETTm1" and grp == "all":
-                    continue  # M=7 already fits in K=7
+                    continue
                 for h in horizons:
                     for seed in args.seeds:
                         cfg = dict(base)
@@ -199,10 +200,9 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         return jobs
 
     if stage == "step2_quantile":
-        # Step 2a: Multi-quantile heads (q5 & q9) + Pinball Loss + CRPS on ETTm1 (all 4) & Weather (96, 192)
         eff_ft = args.ft_type if args.ft_type != "ln" else "ln_head"
         eff_ep = args.epochs if args.epochs > 1 else 3
-        targets = [("ETTm1", [96, 192, 336, 720]), ("Weather", [96, 192])]
+        targets = [("Weather", [96, 192]), ("ETTm1", [96, 192, 336, 720])]
         for q_mode in ("q5", "q9"):
             for ds, horizons in targets:
                 for h in horizons:
@@ -227,11 +227,10 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         return jobs
 
     if stage == "step2_boundary":
-        # Step 2b: Boundary adaptation comparison on ETTm2 (96, 192) and Weather (96, 192)
         eff_q = args.quantile_mode if args.quantile_mode != "none" else "q5"
         eff_ft = args.ft_type if args.ft_type != "ln" else "ln_head"
         eff_ep = args.epochs if args.epochs > 1 else 3
-        targets = [("ETTm2", [96, 192]), ("Weather", [96, 192])]
+        targets = [("Weather", [96, 192]), ("ETTm2", [96, 192])]
         for clip_mode in ("none", "hard_clip", "filter_train", "soft_clip"):
             for ds, horizons in targets:
                 for h in horizons:
@@ -256,7 +255,6 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
         return jobs
 
     if stage == "step2_ft_scope":
-        # Step 2c: Fine-tuning parameter scope ablation on ETTm1 (96, 192), 1~3 epochs + early stopping
         eff_q = args.quantile_mode if args.quantile_mode != "none" else "q5"
         eff_clip = args.clip_mode if args.clip_mode != "none" else "soft_clip"
         eff_ep = args.epochs if args.epochs > 1 else 3
@@ -285,17 +283,30 @@ def build_stage_jobs(stage: str, args) -> List[Dict[str, Any]]:
     raise ValueError(f"Unknown stage={stage!r}")
 
 
-def evaluate_split(
-    model,
-    windows,
-    device,
-    batch_size: int,
-    max_steps: int = 0,
-    desc: str = "eval",
-):
+def job_output_dir(save_root: Path, cfg: Dict[str, Any]) -> Path:
+    return save_root / "runs" / cfg["tag"] / cfg["dataset"] / str(cfg["horizon"]) / f"seed_{cfg['seed']}"
+
+
+def job_log_path(save_root: Path, cfg: Dict[str, Any]) -> Path:
+    log_dir = save_root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"{cfg['tag']}__{cfg['dataset']}_H{cfg['horizon']}_seed{cfg['seed']}.log"
+
+
+def is_job_completed(out_dir: Path) -> bool:
+    metrics_path = out_dir / "metrics.json"
+    if not metrics_path.is_file():
+        return False
+    try:
+        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        return math.isfinite(float(data["mse"])) and math.isfinite(float(data["mae"]))
+    except Exception:
+        return False
+
+
+def evaluate_split(model, windows, device, batch_size: int, progress, max_steps: int = 0, desc: str = "eval"):
     import numpy as np
     import torch
-    from tqdm import tqdm
     from visiontspp_course.losses import crps_sum, pinball_loss
 
     model.eval()
@@ -310,7 +321,7 @@ def evaluate_split(
         starts = starts[:max_steps]
 
     with torch.no_grad():
-        for start in tqdm(starts, desc=desc, leave=False, dynamic_ncols=True, mininterval=1.0):
+        for start in progress(starts, desc=desc):
             indices = np.arange(start, min(start + batch_size, windows.count))
             hist, fut = windows.take(indices, device)
             y_point, y_q = model(hist)
@@ -340,11 +351,11 @@ def run_single_job(
     dataset_root: Path,
     out_dir: Path,
     gpu_label: str,
+    progress,
 ) -> Dict[str, Any]:
     import numpy as np
     import torch
     import torch.nn.functional as F
-    from tqdm import tqdm
 
     from visiontspp_course.data import load_splits
     from visiontspp_course.grouping import build_static_groups
@@ -403,11 +414,20 @@ def run_single_job(
     trainable_params = int(sum(p.numel() for p in trainable.values()))
     total_params = int(sum(p.numel() for p in model.parameters()))
 
+    train_split = splits["train"]
+    batch_size = int(cfg["batch_size"])
+    imgs_per_win = max(len(group_sizes), 1)
+    max_imgs = max(int(cfg.get("max_imgs_per_micro_batch", 32)), imgs_per_win)
+    vram_safe_micro = max(1, max_imgs // imgs_per_win)
+    micro_batch = min(int(cfg["micro_batch"]), batch_size, vram_safe_micro)
+    eval_batch = max(1, min(max(micro_batch, 16), max(1, (max_imgs * 2) // imgs_per_win)))
+
     print(
         f"[{cfg['tag']}] {cfg['dataset']} H={cfg['horizon']} seed={seed} | "
-        f"device={device} (GPU={gpu_label}) | nvars={nvars}, groups={group_sizes} "
-        f"({len(group_sizes)} imgs/window) | align={cfg['align_mode']} "
-        f"(num_patch_in={model.num_patch_input}, extra_pad={model.extra_padding}) | "
+        f"GPU={gpu_label} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu'}) | "
+        f"nvars={nvars}, groups={group_sizes} ({imgs_per_win} imgs/win) | "
+        f"batch={batch_size}, micro={micro_batch} ({micro_batch * imgs_per_win} imgs/step) | "
+        f"align={cfg['align_mode']} (patch_in={model.num_patch_input}, extra_pad={model.extra_padding}) | "
         f"q={cfg['quantile_mode']} clip={cfg['clip_mode']} ft={cfg['ft_type']} "
         f"trainable={trainable_params:,}/{total_params:,}",
         flush=True,
@@ -419,13 +439,6 @@ def run_single_job(
     optimizer = torch.optim.Adam(trainable.values(), lr=float(cfg["lr"])) if trainable else None
     rng = np.random.default_rng(seed)
 
-    train_split = splits["train"]
-    batch_size = int(cfg["batch_size"])
-    imgs_per_win = max(len(group_sizes), 1)
-    max_imgs = max(int(cfg.get("max_imgs_per_micro_batch", 64)), imgs_per_win)
-    vram_safe_micro = max(1, max_imgs // imgs_per_win)
-    micro_batch = min(int(cfg["micro_batch"]), batch_size, vram_safe_micro)
-    eval_batch = max(1, min(max(micro_batch, 16), max(1, (max_imgs * 2) // imgs_per_win)))
     epochs = int(cfg["epochs"])
     patience = int(cfg["patience"])
     max_train_steps = int(cfg["max_train_steps"])
@@ -450,19 +463,12 @@ def run_single_job(
         ep_elems = 0
         ep_dropped = []  # type: List[float]
 
-        pbar = tqdm(
-            starts,
-            desc=f"GPU{gpu_label} {cfg['tag']} {cfg['dataset']}/{cfg['horizon']} ep{epoch}/{epochs}",
-            leave=False,
-            dynamic_ncols=True,
-            mininterval=1.0,
-        )
-        for step, start in enumerate(pbar, 1):
+        desc = f"GPU{gpu_label} {cfg['tag']} {cfg['dataset']}/{cfg['horizon']} ep{epoch}/{epochs}"
+        for step, start in enumerate(progress(starts, desc=desc), 1):
             batch_idx = order[start : start + batch_size]
             if optimizer is not None:
                 optimizer.zero_grad()
 
-            # Compute exact kept sample count when filter_train is active
             micro_chunks = []
             total_kept_elems = 0
             for offset in range(0, len(batch_idx), micro_batch):
@@ -494,6 +500,9 @@ def run_single_job(
             if optimizer is not None:
                 optimizer.step()
 
+            if step % 200 == 0:
+                print(f"  Epoch {epoch}, step {step}/{len(starts)}", flush=True)
+
         ep_sec = time.time() - t_ep
         epoch_times.append(ep_sec)
         train_loss = float(ep_loss_sum.item() / max(ep_elems, 1))
@@ -505,8 +514,9 @@ def run_single_job(
             splits["val"],
             device=device,
             batch_size=eval_batch,
+            progress=progress,
             max_steps=max_eval_steps,
-            desc=f"GPU{gpu_label} val ep{epoch}",
+            desc=f"GPU{gpu_label} {cfg['dataset']}/{cfg['horizon']} val {epoch}",
         )
         print(
             f"  Epoch {epoch}/{epochs} ({ep_sec:.1f}s): "
@@ -530,7 +540,6 @@ def run_single_job(
 
     train_total_sec = time.time() - t_train_start
 
-    # Restore best checkpoint & evaluate on test split
     with torch.no_grad():
         for name, param in trainable.items():
             param.copy_(best_state[name].to(device))
@@ -540,8 +549,9 @@ def run_single_job(
         splits["test"],
         device=device,
         batch_size=eval_batch,
+        progress=progress,
         max_steps=max_eval_steps,
-        desc=f"GPU{gpu_label} test",
+        desc=f"GPU{gpu_label} {cfg['dataset']}/{cfg['horizon']} test",
     )
 
     peak_vram_mb = (
@@ -554,6 +564,7 @@ def run_single_job(
     torch.save(best_state, out_dir / "trainable_weights.pt")
 
     result = dict(
+        stage=cfg["stage"],
         tag=cfg["tag"],
         dataset=cfg["dataset"],
         horizon=int(cfg["horizon"]),
@@ -562,7 +573,7 @@ def run_single_job(
         grouping=cfg["grouping"],
         max_group_size=int(cfg["max_group_size"]),
         group_sizes=group_sizes,
-        images_per_window=len(group_sizes),
+        images_per_window=imgs_per_win,
         sim_metric=cfg["sim_metric"],
         color_mode=cfg["color_mode"],
         align_mode=cfg["align_mode"],
@@ -593,7 +604,7 @@ def run_single_job(
 
 def write_summaries(save_root: Path):
     rows = []
-    for metrics_file in sorted(save_root.glob("*/*/*/seed_*/metrics.json")):
+    for metrics_file in sorted((save_root / "runs").glob("*/*/*/seed_*/metrics.json")):
         try:
             data = json.loads(metrics_file.read_text(encoding="utf-8"))
             rows.append(data)
@@ -603,23 +614,26 @@ def write_summaries(save_root: Path):
         return
 
     fields = [
-        "tag", "dataset", "horizon", "seed", "grouping", "max_group_size",
-        "images_per_window", "sim_metric", "color_mode", "align_mode",
-        "quantile_mode", "clip_mode", "ft_type", "epochs", "best_epoch",
-        "mse", "mae", "crps", "val_loss", "epoch_time_sec", "peak_vram_mb",
-        "trainable_params", "filtered_train_ratio",
+        "stage", "tag", "dataset", "horizon", "seed", "gpu",
+        "grouping", "max_group_size", "images_per_window", "sim_metric",
+        "color_mode", "align_mode", "quantile_mode", "clip_mode", "ft_type",
+        "epochs", "best_epoch", "mse", "mae", "crps", "val_loss",
+        "epoch_time_sec", "peak_vram_mb", "trainable_params", "filtered_train_ratio",
     ]
-    with (save_root / "runs.csv").open("w", newline="", encoding="utf-8") as f:
+    runs_tmp = save_root / "runs.csv.tmp"
+    with runs_tmp.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+    runs_tmp.replace(save_root / "runs.csv")
 
     grouped = {}  # type: Dict[Tuple[str, str, int], List[Dict[str, Any]]]
     for r in rows:
         key = (r["tag"], r["dataset"], int(r["horizon"]))
         grouped.setdefault(key, []).append(r)
 
-    with (save_root / "summary.csv").open("w", newline="", encoding="utf-8") as f:
+    summary_tmp = save_root / "summary.csv.tmp"
+    with summary_tmp.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
             "tag", "dataset", "horizon", "runs",
@@ -645,6 +659,83 @@ def write_summaries(save_root: Path):
                 grp[0]["images_per_window"],
                 grp[0]["trainable_params"],
             ])
+    summary_tmp.replace(save_root / "summary.csv")
+
+
+def worker_loop(
+    gpu: str,
+    gpu_uuid: str,
+    job_queue,
+    ckpt_path: str,
+    dataset_root: str,
+    save_root: str,
+    position: int,
+    progress_lock,
+    summary_lock,
+):
+    if gpu_uuid == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_uuid
+    os.environ["MPLBACKEND"] = "Agg"
+
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+
+    import torch
+    from tqdm import tqdm
+
+    tqdm.set_lock(progress_lock)
+    torch.set_num_threads(2)
+
+    if gpu_uuid != "cpu" and torch.cuda.device_count() != 1:
+        raise RuntimeError(f"Expected 1 visible CUDA device for GPU {gpu} ({gpu_uuid}), got {torch.cuda.device_count()}")
+
+    def progress(items, desc):
+        return tqdm(
+            items,
+            desc=desc,
+            position=position,
+            leave=False,
+            dynamic_ncols=True,
+            mininterval=1.0,
+            file=sys.__stderr__,
+            disable=not sys.__stderr__.isatty(),
+        )
+
+    save_dir = Path(save_root)
+    ckpt = Path(ckpt_path)
+    data_root = Path(dataset_root)
+    tqdm.write(f"Worker started: physical GPU {gpu} ({gpu_uuid})", file=sys.__stderr__)
+
+    for cfg in iter(job_queue.get, None):
+        out_dir = job_output_dir(save_dir, cfg)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_file = job_log_path(save_dir, cfg)
+        tqdm.write(
+            f"[GPU {gpu}] Start {cfg['tag']} | {cfg['dataset']} H={cfg['horizon']} seed={cfg['seed']}",
+            file=sys.__stderr__,
+        )
+        with log_file.open("a", encoding="utf-8", buffering=1) as log_fh, redirect_stdout(log_fh), redirect_stderr(log_fh):
+            try:
+                result = run_single_job(cfg, ckpt, data_root, out_dir, gpu_label=gpu, progress=progress)
+                tmp = out_dir / "metrics.json.tmp"
+                tmp.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+                tmp.replace(out_dir / "metrics.json")
+                with summary_lock:
+                    write_summaries(save_dir)
+                crps_msg = f" CRPS={result['crps']:.4f}" if result["crps"] is not None else ""
+                tqdm.write(
+                    f"[GPU {gpu}] Done  {cfg['tag']} | {cfg['dataset']} H={cfg['horizon']} seed={cfg['seed']} "
+                    f"-> MSE={result['mse']:.4f} MAE={result['mae']:.4f}{crps_msg} "
+                    f"({result['epoch_time_sec']:.1f}s/ep, {result['peak_vram_mb']:.0f}MB)",
+                    file=sys.__stderr__,
+                )
+            except Exception:
+                traceback.print_exc()
+                tqdm.write(f"[GPU {gpu}] FAILED: see {log_file}", file=sys.__stderr__)
+        if gpu_uuid != "cpu" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def parse_args():
@@ -655,10 +746,26 @@ def parse_args():
         default="custom",
         help="Run a predefined experimental stage or 'custom' single/grid run.",
     )
-    parser.add_argument("--gpu", type=str, default="1", help="Physical GPU index (default: 1) or 'cpu'.")
+    parser.add_argument(
+        "--gpus",
+        nargs="+",
+        default=["2", "3"],
+        help="Physical GPU indices for parallel execution (default: 2 3). Use '--gpus cpu' for CPU.",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=str,
+        default=None,
+        help="Backward-compatible alias for a single GPU (overrides --gpus if set).",
+    )
     parser.add_argument("--ckpt-path", type=Path, default=REPO_ROOT / "ckpt" / "mae_visualize_vit_base.pth")
     parser.add_argument("--dataset-root", type=Path, default=REPO_ROOT / "dataset")
-    parser.add_argument("--save-dir", type=Path, default=REPO_ROOT / "save" / "course_exp")
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=REPO_ROOT / "save" / "course_exp",
+        help="Single unified output folder for all logs, weights, metrics, runs.csv, and summary.csv.",
+    )
     parser.add_argument("--tag", type=str, default="", help="Optional experiment tag name for --stage custom.")
 
     # Custom grid parameters
@@ -681,11 +788,17 @@ def parse_args():
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
 
-    # Optimization
+    # Optimization & VRAM safety
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32, help="Multivariate windows per optimizer step.")
-    parser.add_argument("--micro-batch", type=int, default=16, help="Multivariate windows per micro-batch.")
+    parser.add_argument("--micro-batch", type=int, default=16, help="Max multivariate windows per micro-batch.")
+    parser.add_argument(
+        "--max-imgs-per-step",
+        type=int,
+        default=32,
+        help="Cap MAE images per micro-batch to bound VRAM (~5-7 GB at 32 imgs) when sharing GPUs.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
 
     # Debugging / Control
@@ -697,43 +810,96 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
-    gpu_uuid = bind_gpu_early(args.gpu)
-    print(f"Bound physical GPU {args.gpu} ({gpu_uuid})", flush=True)
+    gpus = [args.gpu] if args.gpu is not None else list(dict.fromkeys(args.gpus))
 
     if not args.ckpt_path.is_file():
         print(f"ERROR: Checkpoint not found: {args.ckpt_path}", file=sys.stderr)
-        print("Hint: run `bash visiontspp_course/scripts/setup_container.sh` to symlink ~/VisionTS/ckpt", file=sys.stderr)
+        print("Hint: run `bash visiontspp_course/scripts/setup_container.sh`", file=sys.stderr)
         return 1
     if not args.dataset_root.is_dir():
         print(f"ERROR: Dataset root not found: {args.dataset_root}", file=sys.stderr)
-        print("Hint: run `bash visiontspp_course/scripts/setup_container.sh` to symlink ~/VisionTS/long_term_tsf/dataset", file=sys.stderr)
+        print("Hint: run `bash visiontspp_course/scripts/setup_container.sh`", file=sys.stderr)
         return 1
 
-    jobs = build_stage_jobs(args.stage, args)
-    save_root = args.save_dir / args.stage
-    save_root.mkdir(parents=True, exist_ok=True)
-    print(f"Stage={args.stage}: {len(jobs)} jobs -> {save_root}", flush=True)
+    gpu_map = resolve_gpu_uuids(gpus)
+    all_jobs = build_stage_jobs(args.stage, args)
+    save_root = args.save_dir.resolve()
+    (save_root / "runs").mkdir(parents=True, exist_ok=True)
+    (save_root / "logs").mkdir(parents=True, exist_ok=True)
 
-    completed = 0
-    for idx, cfg in enumerate(jobs, 1):
-        out_dir = save_root / cfg["tag"] / cfg["dataset"] / str(cfg["horizon"]) / f"seed_{cfg['seed']}"
-        metrics_path = out_dir / "metrics.json"
-        if metrics_path.is_file() and not args.overwrite:
-            print(f"[{idx}/{len(jobs)}] Skip completed: {out_dir}", flush=True)
-            completed += 1
-            continue
+    pending = [
+        cfg for cfg in all_jobs
+        if args.overwrite or not is_job_completed(job_output_dir(save_root, cfg))
+    ]
+    skipped = len(all_jobs) - len(pending)
 
-        print(f"\n[{idx}/{len(jobs)}] Running -> {out_dir}", flush=True)
-        result = run_single_job(cfg, args.ckpt_path, args.dataset_root, out_dir, gpu_label=args.gpu)
-        tmp = out_dir / "metrics.json.tmp"
-        tmp.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(metrics_path)
-        completed += 1
+    manifest_entry = dict(
+        timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+        stage=args.stage,
+        gpus=gpu_map,
+        max_imgs_per_step=args.max_imgs_per_step,
+        total_jobs=len(all_jobs),
+        pending_jobs=len(pending),
+    )
+    with (save_root / "launch_history.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(manifest_entry) + "\n")
+
+    print(
+        f"Stage={args.stage} | GPUs={gpus} (max_imgs_per_step={args.max_imgs_per_step}) | "
+        f"Unified dir: {save_root} | {skipped} completed, {len(pending)} pending",
+        flush=True,
+    )
+    if not pending:
         write_summaries(save_root)
+        print(f"All jobs already completed. Summary: {save_root / 'summary.csv'}", flush=True)
+        return 0
+
+    ctx = mp.get_context("spawn")
+    job_queue = ctx.Queue()
+    for cfg in pending:
+        job_queue.put(cfg)
+
+    active_gpus = gpus[: len(pending)]
+    progress_lock = ctx.RLock()
+    summary_lock = ctx.Lock()
+    processes = [
+        ctx.Process(
+            target=worker_loop,
+            args=(
+                gpu,
+                gpu_map[gpu],
+                job_queue,
+                str(args.ckpt_path),
+                str(args.dataset_root),
+                str(save_root),
+                pos,
+                progress_lock,
+                summary_lock,
+            ),
+        )
+        for pos, gpu in enumerate(active_gpus)
+    ]
+
+    for proc in processes:
+        job_queue.put(None)
+        proc.start()
+
+    try:
+        for proc in processes:
+            proc.join()
+    except KeyboardInterrupt:
+        for proc in processes:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in processes:
+            proc.join()
+        write_summaries(save_root)
+        return 130
 
     write_summaries(save_root)
-    print(f"\nDone ({completed}/{len(jobs)}). Summary: {save_root / 'summary.csv'}", flush=True)
-    return 0
+    done_now = sum(1 for cfg in all_jobs if is_job_completed(job_output_dir(save_root, cfg)))
+    print(f"\nCompleted {done_now}/{len(all_jobs)} jobs. Unified summary: {save_root / 'summary.csv'}", flush=True)
+    return int(done_now != len(all_jobs) or any(p.exitcode for p in processes))
 
 
 if __name__ == "__main__":
